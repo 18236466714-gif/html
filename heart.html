@@ -1,0 +1,875 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <title>Heart</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+    * {
+      box-sizing: border-box;
+    }
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: #000000;
+      font-family: "Segoe UI", "PingFang SC", system-ui, sans-serif;
+    }
+    #canvas-wrap {
+      position: fixed;
+      inset: 0;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+    /* 暗角只在后期里做一层，避免 HTML 叠在 canvas 上造成「双层画框」割裂 */
+  </style>
+</head>
+<body>
+  <div id="canvas-wrap"></div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+    import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+    import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+    import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+    import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+    import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+    import { Reflector } from "three/addons/objects/Reflector.js";
+
+    // ---------- 画质拉满（5060 友好；极低配机器请自行调低 POINT_CAP / RENDER_MULT）----------
+    const QUALITY = 1.0;
+    const POINT_CAP = 300000;
+    const TARGET_POINTS = Math.min(POINT_CAP, Math.floor(560000 * QUALITY));
+    /** 在系统 DPR 基础上再乘倍数，显著增加填充率（最吃 GPU） */
+    const RENDER_MULT = 2.15;
+    const SAMPLE_SEED = 2;
+    const ELEV_DEG = 18;
+    const AZIM_DEG = -55;
+
+    /** 柔光圆粒：更高分辨率 + 更顺的肩部，叠出来更干净 */
+    function makeSoftRoundPointTexture() {
+      const s = 256;
+      const cvs = document.createElement("canvas");
+      cvs.width = s;
+      cvs.height = s;
+      const ctx = cvs.getContext("2d");
+      const cx = s / 2;
+      const r = s * 0.5;
+      const g = ctx.createRadialGradient(cx, cx, 0, cx, cx, r);
+      g.addColorStop(0, "rgba(255,255,255,1)");
+      g.addColorStop(0.14, "rgba(255,255,255,0.92)");
+      g.addColorStop(0.38, "rgba(255,255,255,0.48)");
+      g.addColorStop(0.62, "rgba(255,255,255,0.12)");
+      g.addColorStop(0.84, "rgba(255,255,255,0.025)");
+      g.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, s, s);
+      const tex = new THREE.CanvasTexture(cvs);
+      tex.magFilter = THREE.LinearFilter;
+      tex.minFilter = THREE.LinearFilter;
+      tex.generateMipmaps = false;
+      tex.colorSpace = THREE.SRGBColorSpace;
+      return tex;
+    }
+
+    function createHeartPointShaderMaterial(tex, opts) {
+      const {
+        size,
+        opacity,
+        additive,
+        reflectMul,
+      } = opts;
+      const uniforms = {
+        map: { value: tex },
+        opacity: { value: opacity },
+        size: { value: size },
+        uTime: { value: 0 },
+        uBeat: { value: 1 },
+        uReflectMul: { value: reflectMul },
+      };
+      const vertexShader = `
+        attribute vec3 color;
+        attribute float depth01;
+        attribute float sparkleSeed;
+        uniform float size;
+        uniform float uTime;
+        uniform float uBeat;
+        varying vec3 vColor;
+        varying float vSparkle;
+
+        void main() {
+          vColor = color;
+          vSparkle = sparkleSeed;
+          vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+          float depthMul = mix(0.74, 1.26, depth01);
+          float flick = 1.0 + 0.052 * sin(uTime * 3.62 + sparkleSeed * 43.0);
+          float beatPulse = 1.0 + 0.028 * (uBeat - 1.0);
+          gl_PointSize = size * depthMul * flick * beatPulse * (350.0 / max(-mvPosition.z, 0.36));
+          gl_Position = projectionMatrix * mvPosition;
+        }
+      `;
+      const fragmentShader = `
+        uniform sampler2D map;
+        uniform float opacity;
+        uniform float uTime;
+        uniform float uReflectMul;
+        varying vec3 vColor;
+        varying float vSparkle;
+
+        void main() {
+          vec4 texel = texture2D(map, gl_PointCoord);
+          if (texel.a < 0.014) discard;
+          float tw = 1.0 + 0.046 * sin(uTime * 4.12 + vSparkle * 33.0);
+          float da = 0.90 + 0.10 * sin(uTime * 2.28 + vSparkle * 19.5);
+          vec3 col = vColor * tw * uReflectMul;
+          gl_FragColor = vec4(col, texel.a * opacity * da);
+        }
+      `;
+      return new THREE.ShaderMaterial({
+        uniforms,
+        vertexShader,
+        fragmentShader,
+        transparent: true,
+        depthWrite: false,
+        blending: additive ? THREE.AdditiveBlending : THREE.NormalBlending,
+      });
+    }
+
+    function heartF(x, y, z) {
+      const x2 = x * x;
+      const y2 = y * y;
+      const z2 = z * z;
+      const z3 = z2 * z;
+      return (x2 + 2.25 * y2 + z2 - 1) ** 3 - x2 * z3 - 0.1125 * y2 * z3;
+    }
+
+    function mulberry32(seed) {
+      return function () {
+        let t = (seed += 0x6d2b79f5);
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    /**
+     * 单一整体：只在隐式曲面体内（heartF 负侧）均匀 rejection，不再叠一层「壳」，
+     * 避免表面密、内部疏看起来像三块拼在一起。
+     */
+    function sampleHeartPointsSolid(targetPoints, seed) {
+      const rng = mulberry32(seed >>> 0);
+      const lo = -1.45;
+      const hi = 1.45;
+      const xs = [];
+      const ys = [];
+      const zs = [];
+      let remaining = targetPoints;
+      const jitter = 0.0011;
+      const gauss = () => {
+        let u = 0;
+        let v = 0;
+        while (u === 0) u = rng();
+        while (v === 0) v = rng();
+        return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+      };
+
+      while (remaining > 0) {
+        const batch = Math.min(Math.max(Math.floor(remaining * 6), 20000), 250000);
+        const bx = [];
+        const by = [];
+        const bz = [];
+        for (let i = 0; i < batch; i++) {
+          const X = lo + (hi - lo) * rng();
+          const Y = lo + (hi - lo) * rng();
+          const Z = lo + (hi - lo) * rng();
+          if (heartF(X, Y, Z) < 0) {
+            bx.push(X);
+            by.push(Y);
+            bz.push(Z);
+          }
+        }
+        if (bx.length === 0) continue;
+        const take = Math.min(remaining, bx.length);
+        for (let i = 0; i < take; i++) {
+          xs.push(bx[i] + gauss() * jitter);
+          ys.push(by[i] + gauss() * jitter);
+          zs.push(bz[i] + gauss() * jitter);
+        }
+        remaining -= take;
+      }
+      return { xs, ys, zs, n: xs.length };
+    }
+
+    function computeNormals(xs, ys, zs) {
+      const n = xs.length;
+      const nx = new Float32Array(n);
+      const ny = new Float32Array(n);
+      const nz = new Float32Array(n);
+      const eps = 1e-3;
+      for (let i = 0; i < n; i++) {
+        const x = xs[i];
+        const y = ys[i];
+        const z = zs[i];
+        const Fx =
+          (heartF(x + eps, y, z) - heartF(x - eps, y, z)) / (2 * eps);
+        const Fy =
+          (heartF(x, y + eps, z) - heartF(x, y - eps, z)) / (2 * eps);
+        const Fz =
+          (heartF(x, y, z + eps) - heartF(x, y, z - eps)) / (2 * eps);
+        const len = Math.hypot(Fx, Fy, Fz) + 1e-9;
+        nx[i] = Fx / len;
+        ny[i] = Fy / len;
+        nz[i] = Fz / len;
+      }
+      return { nx, ny, nz };
+    }
+
+    /** Python (x,y,z) → Three.js Y-up：(x, z, y) */
+    function pyToThree(x, y, z, out, i3) {
+      out[i3] = x;
+      out[i3 + 1] = z;
+      out[i3 + 2] = y;
+    }
+
+    /**
+     * 红心：略提对比与饱和度，暗部更深、高光更干净，边缘仍带柔粉。
+     */
+    function applyLightVivid(diffuse, depth01, r01, colors, i3, time) {
+      const raw = Math.min(1, Math.max(0, diffuse));
+      const wrapped = Math.pow(raw * 0.14 + 0.86, 0.85);
+      const depthSoft = 0.955 + 0.045 * depth01;
+      let r = (0.14 + 0.58 * wrapped) * depthSoft;
+      let g = (0.008 + 0.036 * wrapped) * depthSoft;
+      let b = (0.012 + 0.044 * wrapped) * depthSoft;
+      const rim = (1 - raw) ** 2.55;
+      r += rim * (0.095 + 0.038 * Math.sin(time * 1.55 + r01 * 9));
+      g += rim * (0.038 + 0.028 * Math.sin(time * 1.3 + r01 * 7));
+      b += rim * (0.112 + 0.048 * Math.sin(time * 1.45 + r01 * 8));
+      const blush = (1 - r01) * 0.035 * (0.5 + 0.5 * Math.sin(time * 0.85));
+      g += blush;
+      b += blush * 0.88;
+      const micro = 0.016 * Math.sin(time * 2.15 + r01 * 14 + i3 * 0.006);
+      r += micro;
+      g += micro * 0.4;
+      b += micro * 0.46;
+      const pulse =
+        1.03 +
+        0.04 * Math.sin(time * Math.PI * 2 * 0.95) +
+        0.022 * Math.sin(time * Math.PI * 2 * 1.95 + 0.9);
+      const shimmer = 1 + 0.036 * Math.sin(time * 2.35 + r01 * 16 + i3 * 0.007);
+      r = Math.min(1, Math.max(0, r * pulse * shimmer));
+      g = Math.min(1, Math.max(0, g * pulse * shimmer));
+      b = Math.min(1, Math.max(0, b * pulse * shimmer));
+      const sat = 1.04;
+      const L = 0.299 * r + 0.587 * g + 0.114 * b;
+      r = Math.min(1, L + (r - L) * sat);
+      g = Math.min(1, L + (g - L) * sat);
+      b = Math.min(1, L + (b - L) * sat);
+      colors[i3] = r;
+      colors[i3 + 1] = g;
+      colors[i3 + 2] = b;
+    }
+
+    const { xs, ys, zs, n } = sampleHeartPointsSolid(TARGET_POINTS, SAMPLE_SEED);
+    const { nx, ny, nz } = computeNormals(xs, ys, zs);
+
+    let zmin = Infinity;
+    let zmax = -Infinity;
+    let rmin = Infinity;
+    let rmax = -Infinity;
+    const rtmp = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const z = zs[i];
+      if (z < zmin) zmin = z;
+      if (z > zmax) zmax = z;
+      const rr = Math.hypot(xs[i], ys[i], zs[i]);
+      rtmp[i] = rr;
+      if (rr < rmin) rmin = rr;
+      if (rr > rmax) rmax = rr;
+    }
+    const zptp = zmax - zmin + 1e-9;
+    const rptp = rmax - rmin + 1e-9;
+    const depth01 = new Float32Array(n);
+    const r01 = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      depth01[i] = (zs[i] - zmin) / zptp;
+      r01[i] = (rtmp[i] - rmin) / rptp;
+    }
+
+    const basePos = new Float32Array(n * 3);
+    const normals = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      const i3 = i * 3;
+      pyToThree(xs[i], ys[i], zs[i], basePos, i3);
+      pyToThree(nx[i], ny[i], nz[i], normals, i3);
+    }
+
+    const positions = new Float32Array(basePos);
+    const colors = new Float32Array(n * 3);
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    geometry.setAttribute("depth01", new THREE.BufferAttribute(depth01, 1));
+    const sparkleSeed = new Float32Array(n);
+    const sparkRng = mulberry32(77001);
+    for (let i = 0; i < n; i++) sparkleSeed[i] = sparkRng() * Math.PI * 2;
+    geometry.setAttribute(
+      "sparkleSeed",
+      new THREE.BufferAttribute(sparkleSeed, 1)
+    );
+
+    const L0i = new THREE.Vector3(0.5, 0.35, 0.55).normalize();
+    const L1i = new THREE.Vector3(-0.38, 0.48, -0.52).normalize();
+    const L2i = new THREE.Vector3(-0.52, 0.26, -0.46).normalize();
+    for (let i = 0; i < n; i++) {
+      const i3 = i * 3;
+      const nxv = normals[i3];
+      const nyv = normals[i3 + 1];
+      const nzv = normals[i3 + 2];
+      const a = Math.max(0, nxv * L0i.x + nyv * L0i.y + nzv * L0i.z);
+      const b = Math.max(0, nxv * L1i.x + nyv * L1i.y + nzv * L1i.z);
+      const c = Math.max(0, nxv * L2i.x + nyv * L2i.y + nzv * L2i.z);
+      const diffuse = Math.min(1, a * 0.48 + b * 0.38 + c * 0.29);
+      applyLightVivid(diffuse, depth01[i], r01[i], colors, i3, 0);
+    }
+    geometry.attributes.color.needsUpdate = true;
+
+    const pointSprite = makeSoftRoundPointTexture();
+
+    const material = createHeartPointShaderMaterial(pointSprite, {
+      size: 0.038,
+      opacity: 1,
+      additive: false,
+      reflectMul: 1,
+    });
+
+    const points = new THREE.Points(geometry, material);
+    /** 与主心同一几何，additive 柔雾；uBeat 略滞后主粒子，叠起来更「软糯」 */
+    const auraMaterial = createHeartPointShaderMaterial(pointSprite, {
+      size: 0.072,
+      opacity: 0.104,
+      additive: true,
+      reflectMul: 1,
+    });
+    const auraPoints = new THREE.Points(geometry, auraMaterial);
+
+    const heartGroup = new THREE.Group();
+    heartGroup.add(auraPoints);
+    heartGroup.add(points);
+
+    const SPARK_N = 5200;
+    const sparkPos = new Float32Array(SPARK_N * 3);
+    const sparkCol = new Float32Array(SPARK_N * 3);
+    const sprng = mulberry32(8899);
+    for (let i = 0; i < SPARK_N; i++) {
+      const u = sprng() * 2 - 1;
+      const th = sprng() * Math.PI * 2;
+      const rr = 2.15 + sprng() * 1.85;
+      const s = Math.sqrt(Math.max(0, 1 - u * u));
+      sparkPos[i * 3] = rr * s * Math.cos(th);
+      sparkPos[i * 3 + 1] = rr * s * Math.sin(th);
+      sparkPos[i * 3 + 2] = rr * u;
+      const w = 0.45 + sprng() * 0.55;
+      sparkCol[i * 3] = w * (1.0 + 0.04 * sprng());
+      sparkCol[i * 3 + 1] = w * (0.72 + 0.22 * sprng());
+      sparkCol[i * 3 + 2] = w * (0.85 + 0.14 * sprng());
+    }
+    const sparkGeo = new THREE.BufferGeometry();
+    sparkGeo.setAttribute("position", new THREE.BufferAttribute(sparkPos, 3));
+    sparkGeo.setAttribute("color", new THREE.BufferAttribute(sparkCol, 3));
+    const sparks = new THREE.Points(
+      sparkGeo,
+      new THREE.PointsMaterial({
+        map: pointSprite,
+        size: 0.032,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.66,
+        alphaTest: 0.02,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        sizeAttenuation: true,
+      })
+    );
+    const sparkGroup = new THREE.Group();
+    sparkGroup.add(sparks);
+
+    const STAR_N = 26000;
+    const starPos = new Float32Array(STAR_N * 3);
+    const starCol = new Float32Array(STAR_N * 3);
+    const srng = mulberry32(2025);
+    for (let i = 0; i < STAR_N; i++) {
+      const u = srng() * 2 - 1;
+      const theta = srng() * Math.PI * 2;
+      const rr = 4.5 + srng() * 17.5;
+      const s = Math.sqrt(Math.max(0, 1 - u * u));
+      starPos[i * 3] = rr * s * Math.cos(theta);
+      starPos[i * 3 + 1] = rr * s * Math.sin(theta);
+      starPos[i * 3 + 2] = rr * u;
+      const c = 0.14 + srng() * 0.22;
+      const tint = srng();
+      starCol[i * 3] = c * (0.82 + 0.14 * tint);
+      starCol[i * 3 + 1] = c * (0.88 + 0.12 * tint);
+      starCol[i * 3 + 2] = c * (1.0 + 0.06 * tint);
+    }
+    const starGeo = new THREE.BufferGeometry();
+    starGeo.setAttribute("position", new THREE.BufferAttribute(starPos, 3));
+    starGeo.setAttribute("color", new THREE.BufferAttribute(starCol, 3));
+    const stars = new THREE.Points(
+      starGeo,
+      new THREE.PointsMaterial({
+        map: pointSprite,
+        size: 0.028,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.74,
+        alphaTest: 0.01,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        sizeAttenuation: true,
+      })
+    );
+
+    const FAR_STAR_N = 40000;
+    const farPos = new Float32Array(FAR_STAR_N * 3);
+    const farCol = new Float32Array(FAR_STAR_N * 3);
+    const frng = mulberry32(404);
+    for (let i = 0; i < FAR_STAR_N; i++) {
+      const u = frng() * 2 - 1;
+      const theta = frng() * Math.PI * 2;
+      const rr = 38 + frng() * 52;
+      const s = Math.sqrt(Math.max(0, 1 - u * u));
+      farPos[i * 3] = rr * s * Math.cos(theta);
+      farPos[i * 3 + 1] = rr * s * Math.sin(theta);
+      farPos[i * 3 + 2] = rr * u;
+      const br = 0.09 + frng() * 0.32;
+      const ti = frng();
+      farCol[i * 3] = br * (0.78 + 0.22 * ti);
+      farCol[i * 3 + 1] = br * (0.85 + 0.15 * ti);
+      farCol[i * 3 + 2] = br * (1.0 + 0.06 * ti);
+    }
+    const farGeo = new THREE.BufferGeometry();
+    farGeo.setAttribute("position", new THREE.BufferAttribute(farPos, 3));
+    farGeo.setAttribute("color", new THREE.BufferAttribute(farCol, 3));
+    const farStars = new THREE.Points(
+      farGeo,
+      new THREE.PointsMaterial({
+        map: pointSprite,
+        size: 0.011,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.42,
+        alphaTest: 0.01,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        sizeAttenuation: true,
+      })
+    );
+
+    const SKY_RADIUS = 155;
+    const skyGeo = new THREE.SphereGeometry(SKY_RADIUS, 112, 72);
+    const skyUniforms = { uTime: { value: 0 } };
+    const skyMat = new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      depthWrite: true,
+      depthTest: true,
+      uniforms: skyUniforms,
+      vertexShader: `
+        varying vec3 vDir;
+        void main() {
+          vDir = normalize(position);
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform float uTime;
+        varying vec3 vDir;
+
+        float hash(float n) {
+          return fract(sin(n) * 43758.5453123);
+        }
+        float noise(vec3 x) {
+          vec3 p = floor(x);
+          vec3 f = fract(x);
+          f = f * f * (3.0 - 2.0 * f);
+          float n = p.x + p.y * 57.0 + 113.0 * p.z;
+          return mix(
+            mix(mix(hash(n + 0.0), hash(n + 1.0), f.x),
+                mix(hash(n + 57.0), hash(n + 58.0), f.x), f.y),
+            mix(mix(hash(n + 113.0), hash(n + 114.0), f.x),
+                mix(hash(n + 170.0), hash(n + 171.0), f.x), f.y),
+            f.z          );
+        }
+        float fbm(vec3 p) {
+          float v = 0.0;
+          float a = 0.55;
+          mat3 m = mat3(
+            0.8, 0.6, 0.0,
+            -0.6, 0.8, 0.0,
+            0.0, 0.0, 1.0
+          );
+          for (int i = 0; i < 6; i++) {
+            v += a * noise(p);
+            p = m * p * 2.05;
+            a *= 0.52;
+          }
+          return v;
+        }
+
+        void main() {
+          vec3 d = normalize(vDir);
+          float t = uTime * 0.021;
+          vec3 q = d * 1.5 + vec3(t * 0.1, t * 0.09, t * 0.07);
+          float f = fbm(q);
+          float f2 = fbm(d * 3.8 - vec3(t * 0.32, t * 0.26, t * 0.3)) * 0.38;
+          float f3 = fbm(d * 7.8 + vec3(t * 0.16, 0.0, t * 0.2)) * 0.22;
+          float fog = clamp(f + f2 + f3, 0.0, 1.0);
+          fog = pow(fog, 0.96);
+          float lat = d.y * 0.5 + 0.5;
+          vec3 deep = vec3(0.002, 0.0022, 0.003);
+          vec3 mid = vec3(0.0065, 0.0072, 0.009);
+          vec3 lift = vec3(0.014, 0.0155, 0.019);
+          vec3 col = mix(deep, mid, lat * 0.14 + fog * 0.28);
+          col += lift * fog * fog * 0.18;
+          float band = pow(max(dot(d, normalize(vec3(-0.35, 0.82, 0.22))), 0.0), 6.0);
+          col += vec3(0.012, 0.014, 0.018) * band * 0.22;
+          float ribbon = sin(d.x * 7.5 + t * 1.45) * sin(d.y * 6.2 - t * 0.95) * sin(d.z * 6.8 + t * 0.85);
+          ribbon = ribbon * 0.5 + 0.5;
+          col += vec3(0.0065, 0.0075, 0.009) * ribbon * fog * 0.12;
+          float dust = pow(max(fog - 0.34, 0.0), 2.1) * 0.22;
+          col += vec3(0.014, 0.015, 0.018) * dust;
+          float h = fract(sin(dot(d * 193.0 + floor(t * 0.72), vec3(12.9898, 78.233, 45.164))) * 43758.5453);
+          float spr = step(0.987, h) * 0.48;
+          col += spr * vec3(0.16, 0.17, 0.19);
+          float h2 = fract(sin(dot(d * 311.0, vec3(54.2, 19.7, 102.3))) * 9981.2);
+          float spr2 = step(0.994, h2) * 0.32;
+          col += spr2 * vec3(0.2, 0.21, 0.23);
+          col = pow(col, vec3(0.97));
+          float towardFloor = smoothstep(-0.40, 0.30, -d.y);
+          col = mix(col, vec3(0.0), towardFloor);
+          gl_FragColor = vec4(col, 1.0);
+        }
+      `,
+    });
+    const sky = new THREE.Mesh(skyGeo, skyMat);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+    scene.add(sky);
+    scene.add(farStars);
+    scene.add(stars);
+    scene.add(sparkGroup);
+
+    const camera = new THREE.PerspectiveCamera(
+      40,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      260
+    );
+    const dist = 4.05;
+    const elev = (ELEV_DEG * Math.PI) / 180;
+    const azim = (AZIM_DEG * Math.PI) / 180;
+    camera.position.set(
+      dist * Math.cos(elev) * Math.cos(azim),
+      dist * Math.sin(elev),
+      dist * Math.cos(elev) * Math.sin(azim)
+    );
+    camera.lookAt(0, 0, 0);
+
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      alpha: false,
+      powerPreference: "high-performance",
+    });
+    renderer.setPixelRatio(
+      Math.min(window.devicePixelRatio * RENDER_MULT, 3.5)
+    );
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.02;
+    document.getElementById("canvas-wrap").appendChild(renderer.domElement);
+
+    const pr0 = renderer.getPixelRatio();
+    const groundMirror = new Reflector(new THREE.CircleGeometry(28, 144), {
+      color: 0x030303,
+      textureWidth: Math.max(1024, Math.floor(window.innerWidth * pr0)),
+      textureHeight: Math.max(1024, Math.floor(window.innerHeight * pr0)),
+      clipBias: 0.003,
+      multisample: 4,
+    });
+    groundMirror.position.y = -2.62;
+    groundMirror.rotateX(-Math.PI / 2);
+    scene.add(groundMirror);
+    scene.add(heartGroup);
+
+    const VignetteGrainShader = {
+      uniforms: {
+        tDiffuse: { value: null },
+        uTime: { value: 0 },
+        vignette: { value: 0.22 },
+        grain: { value: 0.016 },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform float uTime;
+        uniform float vignette;
+        uniform float grain;
+        varying vec2 vUv;
+
+        float rand(vec2 co) {
+          return fract(sin(dot(co.xy, vec2(12.9898, 78.233))) * 43758.5453);
+        }
+
+        void main() {
+          vec4 tex = texture2D(tDiffuse, vUv);
+          vec2 uv = (vUv - 0.5) * 1.02;
+          float r2 = dot(uv, uv);
+          float vig = smoothstep(1.48, 0.52, r2);
+          tex.rgb *= mix(1.0 - vignette * 0.42, 1.0, vig);
+          float gn = (rand(vUv * 1200.0 + uTime * 37.0) - 0.5) * grain;
+          tex.rgb += gn;
+          gl_FragColor = tex;
+        }
+      `,
+    };
+
+    const RGBShiftShader = {
+      uniforms: {
+        tDiffuse: { value: null },
+        amount: { value: 0.0012 },
+        angle: { value: 0.35 },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform float amount;
+        uniform float angle;
+        varying vec2 vUv;
+
+        void main() {
+          vec2 off = amount * vec2(cos(angle), sin(angle));
+          float r = texture2D(tDiffuse, vUv + off).r;
+          float g = texture2D(tDiffuse, vUv).g;
+          float b = texture2D(tDiffuse, vUv - off).b;
+          float a = texture2D(tDiffuse, vUv).a;
+          gl_FragColor = vec4(r, g, b, a);
+        }
+      `,
+    };
+
+    const composer = new EffectComposer(renderer);
+    composer.setPixelRatio(renderer.getPixelRatio());
+    composer.addPass(new RenderPass(scene, camera));
+    const bloomPass = new UnrealBloomPass(
+      new THREE.Vector2(window.innerWidth, window.innerHeight),
+      0.168,
+      0.48,
+      0.615
+    );
+    composer.addPass(bloomPass);
+
+    const vignettePass = new ShaderPass(VignetteGrainShader);
+    composer.addPass(vignettePass);
+
+    const rgbPass = new ShaderPass(RGBShiftShader);
+    composer.addPass(rgbPass);
+
+    const outputPass = new OutputPass();
+    composer.addPass(outputPass);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.enablePan = false;
+    controls.autoRotate = true;
+    controls.autoRotateSpeed = 0.22;
+    controls.minPolarAngle = Math.PI * 0.2;
+    controls.maxPolarAngle = Math.PI * 0.8;
+    controls.target.set(0, 0, 0);
+    controls.minDistance = 2.65;
+    controls.maxDistance = 11;
+
+    const canvasEl = renderer.domElement;
+    let lastInteract = performance.now() - 99999;
+    const IDLE_RESUME_MS = 2800;
+    canvasEl.addEventListener(
+      "pointerdown",
+      () => {
+        lastInteract = performance.now();
+        controls.autoRotate = false;
+      },
+      { passive: true }
+    );
+    canvasEl.addEventListener(
+      "wheel",
+      () => {
+        lastInteract = performance.now();
+        controls.autoRotate = false;
+      },
+      { passive: true }
+    );
+
+    const wrapEl = document.getElementById("canvas-wrap");
+    let requestedFs = false;
+    wrapEl.addEventListener("click", () => {
+      if (!requestedFs && document.fullscreenElement == null) {
+        requestedFs = true;
+        document.documentElement.requestFullscreen?.().catch(() => {});
+      }
+    });
+
+    let cursorHideTimer = 0;
+    function bumpCursor() {
+      document.body.style.cursor = "";
+      clearTimeout(cursorHideTimer);
+      cursorHideTimer = setTimeout(() => {
+        if (document.fullscreenElement != null) document.body.style.cursor = "none";
+      }, 2400);
+    }
+    window.addEventListener("mousemove", bumpCursor, { passive: true });
+
+    let t = 0;
+    let smoothedBeat = 1;
+    const L = new THREE.Vector3();
+    const L2 = new THREE.Vector3();
+    const L3 = new THREE.Vector3();
+    const N = new THREE.Vector3();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      t += 1 / 60;
+      const tBeat = t * 0.34;
+      const ph = 2 * Math.PI * 0.78 * tBeat;
+      const beat =
+        1.0 +
+        0.046 * Math.sin(ph) ** 3 +
+        0.032 * Math.sin(2 * ph + 1.15) ** 3 +
+        0.012 * Math.sin(3 * ph + 0.4);
+
+      const beatGlow = beat - 1.0;
+      bloomPass.strength = 0.172 + 0.102 * beatGlow;
+      bloomPass.threshold = 0.618 - 0.052 * beatGlow;
+      renderer.toneMappingExposure = 1.018 + 0.026 * beatGlow;
+
+      smoothedBeat += (beat - smoothedBeat) * 0.11;
+      material.uniforms.uTime.value = t;
+      material.uniforms.uBeat.value = beat;
+      auraMaterial.uniforms.uTime.value = t;
+      auraMaterial.uniforms.uBeat.value = smoothedBeat;
+
+      const tLight = t * 0.22;
+      L.set(
+        0.42 + 0.06 * Math.cos(tLight),
+        0.62,
+        0.48 + 0.06 * Math.sin(tLight)
+      ).normalize();
+      L2.set(
+        -0.38 - 0.05 * Math.cos(tLight * 0.9),
+        0.48,
+        -0.52 - 0.05 * Math.sin(tLight * 0.85)
+      ).normalize();
+      L3.set(
+        -0.52 + 0.045 * Math.cos(tLight * 0.76),
+        0.26 + 0.03 * Math.sin(tLight * 0.55),
+        -0.46 - 0.048 * Math.sin(tLight * 0.71)
+      ).normalize();
+
+      for (let i = 0; i < n; i++) {
+        const i3 = i * 3;
+        positions[i3] = basePos[i3] * beat;
+        positions[i3 + 1] = basePos[i3 + 1] * beat;
+        positions[i3 + 2] = basePos[i3 + 2] * beat;
+
+        N.set(normals[i3], normals[i3 + 1], normals[i3 + 2]);
+        const a = Math.max(0, N.dot(L));
+        const b = Math.max(0, N.dot(L2));
+        const c = Math.max(0, N.dot(L3));
+        const diffuse = Math.min(1, a * 0.47 + b * 0.37 + c * 0.32);
+        applyLightVivid(diffuse, depth01[i], r01[i], colors, i3, t);
+      }
+      geometry.attributes.position.needsUpdate = true;
+      geometry.attributes.color.needsUpdate = true;
+
+      skyUniforms.uTime.value = t;
+      farStars.rotation.y += 0.00018;
+      farStars.rotation.z += 0.00006;
+      stars.rotation.y += 0.0004;
+      stars.rotation.x += 0.00012;
+
+      heartGroup.rotation.y = t * 0.034 + Math.sin(t * 0.09) * 0.065;
+      heartGroup.rotation.x = Math.sin(t * 0.072) * 0.038;
+      heartGroup.rotation.z = Math.sin(t * 0.051) * 0.024;
+      heartGroup.position.y = Math.sin(t * 0.26) * 0.038;
+      heartGroup.scale.setScalar(1 + 0.013 * Math.sin(t * 0.48));
+
+      sparkGroup.rotation.y = t * 0.11;
+      sparkGroup.rotation.x = Math.sin(t * 0.07) * 0.12;
+      const sparkPulse = 0.9 + 0.1 * Math.sin(t * 1.85);
+      sparks.material.opacity = 0.66 * sparkPulse;
+
+      stars.material.opacity = 0.72 + 0.075 * Math.sin(t * 0.71 + 1.1);
+      farStars.material.opacity = 0.4 + 0.048 * Math.sin(t * 0.48 + 2.4);
+
+      camera.fov = 40 + 0.68 * Math.sin(t * 0.312 + 0.62);
+      camera.updateProjectionMatrix();
+
+      vignettePass.uniforms.uTime.value = t;
+
+      if (performance.now() - lastInteract > IDLE_RESUME_MS) {
+        controls.autoRotate = true;
+      }
+
+      controls.update();
+      composer.render();
+    }
+
+    window.addEventListener("resize", () => {
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w, h);
+      composer.setSize(w, h);
+      composer.setPixelRatio(renderer.getPixelRatio());
+      const pr = renderer.getPixelRatio();
+      groundMirror.getRenderTarget().setSize(
+        Math.max(512, Math.floor(w * pr)),
+        Math.max(512, Math.floor(h * pr))
+      );
+    });
+
+    animate();
+  </script>
+</body>
+</html>
